@@ -9,6 +9,11 @@
    decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
 2. 按 priority 升序逐条评估规则，返回首个命中规则的 variant_key；
    规则所需属性缺失（或类型不兼容）一律视为“未命中”并继续下一条。
+   ``operator="segment"`` 的规则引用受众分群：递归解析分群表达式
+   （all/any/not 组合、属性比较、嵌套分群引用），属性缺失按不命中处理，
+   引用的分群不存在 / 检测到循环 / 超过嵌套上限同样按不命中处理；
+   解释链记录每层分群（segment_evaluated）与组合子短路结果
+   （segment_combinator_evaluated / segment_condition_evaluated）。
 3. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
    映射到 0-99 的桶，再按变体权重顺序切桶选变体。
 
@@ -22,6 +27,10 @@ from typing import Any
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
 BUCKET_SPACE = 100
+
+# 分群引用解析的最大嵌套层数（防御性上限；API 保存时已保证无环，
+# 此上限只兜底手工构造的异常数据，超出按未命中处理并记录原因）
+MAX_SEGMENT_DEPTH = 64
 
 
 @dataclass(frozen=True)
@@ -117,11 +126,220 @@ def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float))
 
 
-def evaluate_rule(rule: Rule, context: dict[str, Any]) -> tuple[bool, str]:
-    """评估单条规则。属性缺失或值为 None 一律视为未命中。"""
+def evaluate_rule(
+    rule: Rule,
+    context: dict[str, Any],
+    segments: dict[str, dict] | None = None,
+    segment_steps: list[dict[str, Any]] | None = None,
+) -> tuple[bool, str]:
+    """评估单条规则。属性缺失或值为 None 一律视为未命中。
+
+    ``operator="segment"`` 时 ``values[0]`` 为分群 key：递归解析分群
+    表达式（``segments`` 为 segment_key -> 表达式字典），引用的分群
+    不存在、检测到循环引用或超过嵌套上限一律视为未命中；评估轨迹
+    （每层分群与短路结果）追加到 ``segment_steps``（提供时）。
+    """
+    if rule.operator == "segment":
+        key = rule.values[0] if rule.values else ""
+        steps = segment_steps if segment_steps is not None else []
+        hit = _eval_segment_ref(key, context, segments or {}, 1, (), steps)
+        return hit, f"分群 {key!r} 判定为{'命中' if hit else '未命中'}"
     if rule.attribute not in context or context[rule.attribute] is None:
         return False, f"缺少属性 {rule.attribute!r}，视为未命中"
     return _compare(context[rule.attribute], rule.operator, rule.values)
+
+
+# ---------------------------------------------------------------------------
+# 受众分群表达式求值（纯函数，表达式为 JSON 兼容的 dict 树）
+# ---------------------------------------------------------------------------
+
+
+def _eval_segment_ref(
+    key: str,
+    context: dict[str, Any],
+    segments: dict[str, dict],
+    depth: int,
+    resolving: tuple[str, ...],
+    steps: list[dict[str, Any]],
+) -> bool:
+    """解析一层分群引用，返回是否命中；轨迹追加到 steps。
+
+    ``depth`` 为分群嵌套层数（规则直接引用的分群为第 1 层）；
+    ``resolving`` 为当前解析路径上的分群 key，用于防御循环引用。
+    """
+    if key not in segments:
+        steps.append(
+            {
+                "step": "segment_evaluated",
+                "detail": {
+                    "segment_key": key,
+                    "depth": depth,
+                    "result": "miss",
+                    "reason": f"引用的分群 {key!r} 不存在，视为未命中",
+                },
+            }
+        )
+        return False
+    if key in resolving:
+        cycle = " -> ".join([*resolving, key])
+        steps.append(
+            {
+                "step": "segment_evaluated",
+                "detail": {
+                    "segment_key": key,
+                    "depth": depth,
+                    "result": "miss",
+                    "reason": f"检测到循环引用 {cycle}，视为未命中",
+                },
+            }
+        )
+        return False
+    if depth > MAX_SEGMENT_DEPTH:
+        steps.append(
+            {
+                "step": "segment_evaluated",
+                "detail": {
+                    "segment_key": key,
+                    "depth": depth,
+                    "result": "miss",
+                    "reason": f"超过最大嵌套层数 {MAX_SEGMENT_DEPTH}，视为未命中",
+                },
+            }
+        )
+        return False
+    result = _eval_segment_expr(
+        segments[key], context, segments, depth, (*resolving, key), steps
+    )
+    steps.append(
+        {
+            "step": "segment_evaluated",
+            "detail": {
+                "segment_key": key,
+                "depth": depth,
+                "result": "hit" if result else "miss",
+                "reason": f"分群 {key!r} 表达式判定为{'命中' if result else '未命中'}",
+            },
+        }
+    )
+    return result
+
+
+def _eval_segment_expr(
+    expr: dict,
+    context: dict[str, Any],
+    segments: dict[str, dict],
+    depth: int,
+    resolving: tuple[str, ...],
+    steps: list[dict[str, Any]],
+) -> bool:
+    """评估分群表达式树节点（all/any/not/条件叶子/分群引用）。"""
+    if "all" in expr:
+        children = expr["all"]
+        evaluated = 0
+        result = True
+        for child in children:
+            evaluated += 1
+            if not _eval_segment_expr(child, context, segments, depth, resolving, steps):
+                result = False
+                break  # 短路：首个未命中即终止
+        short_circuited = evaluated < len(children)
+        if result:
+            reason = f"all：全部 {len(children)} 个子表达式命中"
+        elif short_circuited:
+            reason = (
+                f"all：第 {evaluated}/{len(children)} 个子表达式未命中，"
+                f"短路跳过后续 {len(children) - evaluated} 个"
+            )
+        else:
+            reason = f"all：第 {evaluated}/{len(children)} 个子表达式未命中"
+        steps.append(_combinator_step("all", depth, result, evaluated, len(children), reason))
+        return result
+    if "any" in expr:
+        children = expr["any"]
+        evaluated = 0
+        result = False
+        for child in children:
+            evaluated += 1
+            if _eval_segment_expr(child, context, segments, depth, resolving, steps):
+                result = True
+                break  # 短路：首个命中即终止
+        short_circuited = evaluated < len(children)
+        if not result:
+            reason = f"any：全部 {len(children)} 个子表达式均未命中"
+        elif short_circuited:
+            reason = (
+                f"any：第 {evaluated}/{len(children)} 个子表达式命中，"
+                f"短路跳过后续 {len(children) - evaluated} 个"
+            )
+        else:
+            reason = f"any：第 {evaluated}/{len(children)} 个子表达式命中"
+        steps.append(_combinator_step("any", depth, result, evaluated, len(children), reason))
+        return result
+    if "not" in expr:
+        child_hit = _eval_segment_expr(
+            expr["not"], context, segments, depth, resolving, steps
+        )
+        result = not child_hit
+        steps.append(
+            _combinator_step(
+                "not",
+                depth,
+                result,
+                1,
+                1,
+                f"not：子表达式{'命中' if child_hit else '未命中'}，"
+                f"取反为{'命中' if result else '未命中'}",
+            )
+        )
+        return result
+    if "segment" in expr:
+        return _eval_segment_ref(
+            expr["segment"], context, segments, depth + 1, resolving, steps
+        )
+    # 条件叶子：属性缺失 / 值为 None 一律视为未命中
+    attribute = expr.get("attribute", "")
+    operator = expr.get("operator", "eq")
+    values = expr.get("values", [])
+    if attribute not in context or context[attribute] is None:
+        hit, reason = False, f"缺少属性 {attribute!r}，视为未命中"
+    else:
+        hit, reason = _compare(context[attribute], operator, values)
+    steps.append(
+        {
+            "step": "segment_condition_evaluated",
+            "detail": {
+                "depth": depth,
+                "attribute": attribute,
+                "operator": operator,
+                "values": values,
+                "result": "hit" if hit else "miss",
+                "reason": reason,
+            },
+        }
+    )
+    return hit
+
+
+def _combinator_step(
+    combinator: str,
+    depth: int,
+    result: bool,
+    children_evaluated: int,
+    children_total: int,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "step": "segment_combinator_evaluated",
+        "detail": {
+            "combinator": combinator,
+            "depth": depth,
+            "result": "hit" if result else "miss",
+            "children_total": children_total,
+            "children_evaluated": children_evaluated,
+            "short_circuited": children_evaluated < children_total,
+            "reason": reason,
+        },
+    }
 
 
 def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, tuple[int, int]]:
@@ -254,8 +472,13 @@ def decide(
     context: dict[str, Any],
     variants: list[Variant],
     rules: list[Rule],
+    segments: dict[str, dict] | None = None,
 ) -> Decision:
-    """完整判定流程并产出解释链。"""
+    """完整判定流程并产出解释链。
+
+    ``segments`` 为 segment_key -> 表达式字典（operator=segment 的规则
+    按此递归解析）；缺省视为无分群，引用分群的规则一律未命中。
+    """
     explanation: list[dict[str, Any]] = []
     variant_keys = {v.key for v in variants}
 
@@ -279,7 +502,8 @@ def decide(
             raise RuleEvaluationError(
                 f"priority={rule.priority} 的规则引用了不存在的变体 {rule.variant_key!r}"
             )
-        hit, reason = evaluate_rule(rule, context)
+        segment_steps: list[dict[str, Any]] = []
+        hit, reason = evaluate_rule(rule, context, segments, segment_steps)
         explanation.append(
             {
                 "step": "rule_evaluated",
@@ -294,6 +518,8 @@ def decide(
                 },
             }
         )
+        # 分群规则的递归解析轨迹（每层分群 + 短路结果）跟在规则步骤之后
+        explanation.extend(segment_steps)
         if hit:
             explanation.append(
                 {

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine, SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import FlagConfig, FlagConfigVersion, FlagOverride  # noqa: E402
+from app.models import FlagConfig, FlagConfigVersion, FlagOverride, Segment  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -27,13 +27,14 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clean_flags():
-    """每个用例后清空开关、版本历史与强制变体，保证 flag_key 可重复使用（快照保留）。"""
+    """每个用例后清空开关、版本历史、强制变体与分群，保证 key 可重复使用（快照保留）。"""
     yield
     db = SessionLocal()
     try:
         db.query(FlagOverride).delete()
         db.query(FlagConfigVersion).delete()
         db.query(FlagConfig).delete()
+        db.query(Segment).delete()
         db.commit()
     finally:
         db.close()

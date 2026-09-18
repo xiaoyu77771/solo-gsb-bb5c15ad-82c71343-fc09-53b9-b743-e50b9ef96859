@@ -15,6 +15,11 @@
 - POST /api/v1/releases                创建多开关发布批次（复用校验与影响预览，不改动当前配置）
 - POST /api/v1/releases/{release_id}/commit  原子提交批次（事务内再核对全部版本，幂等）
 - GET  /api/v1/releases/{release_id}   查询批次状态、逐开关预览摘要与提交后版本号
+- POST /api/v1/segments                创建受众分群（key 冲突 409；引用缺失 / 循环引用 422）
+- GET  /api/v1/segments                列出全部分群
+- GET  /api/v1/segments/{segment_key}  查看单个分群
+- PUT  /api/v1/segments/{segment_key}  更新分群（被引用 409；循环引用 422）
+- DELETE /api/v1/segments/{segment_key} 删除分群（被引用 409）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions          判定快照审计列表（不透明游标分页 + 组合过滤）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询单条判定快照
@@ -54,6 +59,9 @@ from app.schemas import (
     ReleaseCreateRequest,
     ReleaseResponse,
     RollbackRequest,
+    SegmentResponse,
+    SegmentUpdateRequest,
+    SegmentUpsertRequest,
 )
 
 
@@ -67,6 +75,7 @@ async def lifespan(app: FastAPI):
         crud.ensure_activation_window_columns(db)
         crud.ensure_snapshot_decision_path(db)
         crud.ensure_decision_audit_indexes(db)
+        crud.ensure_segments_table(db)
         crud.backfill_missing_versions(db)
     finally:
         db.close()
@@ -325,6 +334,9 @@ def rollback_flag(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except crud.VersionNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ValueError as exc:
+        # 目标历史版本引用的分群已被删除
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     return crud.flag_to_response(flag)
 
 
@@ -385,7 +397,8 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
             decision = eng.override_decision(active_override)
 
     if decision is None:
-        decision = decide(flag.flag_key, req.user_id, req.context, variants, rules)
+        segments = crud.get_segment_expression_map(db)
+        decision = decide(flag.flag_key, req.user_id, req.context, variants, rules, segments)
 
     try:
         crud.save_snapshot(
@@ -456,11 +469,12 @@ def _impact_preview(
     candidate_window: eng.ActivationWindow | None,
     users: list[PreviewUser],
     now: datetime,
+    segments: dict[str, dict],
 ) -> tuple[list[PreviewChange], dict[str, dict[str, int]]]:
     """对每个用户分别用当前线上配置与候选配置做只读判定并对比。
 
     返回 (发生变化的用户列表, 当前变体->候选变体迁移计数)；不写版本、
-    不写快照。两侧判定共用同一判定时刻，保证窗口判定可比。
+    不写快照。两侧判定共用同一判定时刻与同一分群快照，保证结果可比。
     """
     current_rules = crud.parse_rules(flag.rules_json)
     current_variants = crud.parse_variants(flag.variants_json)
@@ -469,7 +483,7 @@ def _impact_preview(
     def _decide_with_window(variants, rules, window, user: PreviewUser) -> eng.Decision:
         if window is not None and not eng.window_is_active(window, now):
             return eng.inactive_decision(window, now)
-        return decide(flag.flag_key, user.user_id, user.context, variants, rules)
+        return decide(flag.flag_key, user.user_id, user.context, variants, rules, segments)
 
     changes: list[PreviewChange] = []
     migration: dict[str, dict[str, int]] = {}
@@ -536,11 +550,16 @@ def preview_impact(
         )
 
     candidate_rules, candidate_variants, candidate_window = _build_candidate_config(req)
+    try:
+        crud.validate_flag_segment_refs(db, candidate_rules)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    # 整个请求使用同一时刻判定窗口，保证各用户结果可比
+    # 整个请求使用同一时刻判定窗口、同一份分群快照，保证各用户结果可比
     now = datetime.now(timezone.utc)
+    segments = crud.get_segment_expression_map(db)
     changes, migration = _impact_preview(
-        flag, candidate_rules, candidate_variants, candidate_window, req.users, now
+        flag, candidate_rules, candidate_variants, candidate_window, req.users, now, segments
     )
 
     return PreviewImpactResponse(
@@ -586,13 +605,20 @@ def create_release(req: ReleaseCreateRequest, db: Session = Depends(get_db)):
             )
         flags[cand.flag_key] = flag
 
-    # 整个批次共用同一判定时刻：与单开关预览一致，各候选结果可比
+    # 整个批次共用同一判定时刻与分群快照：与单开关预览一致，各候选结果可比
     now = datetime.now(timezone.utc)
+    segments = crud.get_segment_expression_map(db)
     items: list[dict] = []
     for cand in req.candidates:
         flag = flags[cand.flag_key]
         rules_json, variants_json, window_json = crud.serialize_config_body(cand)
         candidate_rules, candidate_variants, candidate_window = _build_candidate_config(cand)
+        try:
+            crud.validate_flag_segment_refs(db, candidate_rules)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            )
         changes, migration = _impact_preview(
             flag,
             candidate_rules,
@@ -600,6 +626,7 @@ def create_release(req: ReleaseCreateRequest, db: Session = Depends(get_db)):
             candidate_window,
             req.users,
             now,
+            segments,
         )
         items.append(
             {
@@ -650,6 +677,9 @@ def commit_release(release_id: str, db: Session = Depends(get_db)):
         batch = crud.commit_release(db, batch)
     except crud.VersionConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        # 候选引用的分群在批次创建后被删除
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     return crud.release_to_response(batch)
 
 
@@ -666,6 +696,85 @@ def get_release(release_id: str, db: Session = Depends(get_db)):
             detail=f"发布批次 {release_id!r} 不存在",
         )
     return crud.release_to_response(batch)
+
+
+# ---------------------------------------------------------------------------
+# 受众分群（segments）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/segments",
+    response_model=SegmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_segment(payload: SegmentUpsertRequest, db: Session = Depends(get_db)):
+    """创建受众分群。
+
+    - 表达式为可嵌套的 all/any/not 组合 + 属性比较条件，可用
+      ``{"segment": "key"}`` 引用其他分群；
+    - 引用的分群必须已存在，且不得形成直接或间接循环引用（否则 422）；
+    - segment_key 已存在返回 409。
+    """
+    try:
+        seg = crud.create_segment(db, payload)
+    except crud.SegmentConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return crud.segment_to_response(seg)
+
+
+@app.get("/api/v1/segments", response_model=list[SegmentResponse])
+def list_segments(db: Session = Depends(get_db)):
+    return [crud.segment_to_response(s) for s in crud.list_segments(db)]
+
+
+@app.get("/api/v1/segments/{segment_key}", response_model=SegmentResponse)
+def get_segment(segment_key: str, db: Session = Depends(get_db)):
+    seg = crud.get_segment_or_none(db, segment_key)
+    if seg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"分群 {segment_key!r} 不存在"
+        )
+    return crud.segment_to_response(seg)
+
+
+@app.put("/api/v1/segments/{segment_key}", response_model=SegmentResponse)
+def update_segment(
+    segment_key: str, payload: SegmentUpdateRequest, db: Session = Depends(get_db)
+):
+    """整体覆盖分群的 description 与 expression。
+
+    - 分群不存在返回 404；
+    - 新表达式引用不存在的分群、或形成直接或间接循环引用返回 422；
+    - 分群仍被其他分群或开关当前规则引用时返回 409（避免既有判定静默变化），
+      需先解除引用再更新。
+    """
+    try:
+        seg = crud.update_segment(db, segment_key, payload)
+    except crud.SegmentConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    if seg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"分群 {segment_key!r} 不存在"
+        )
+    return crud.segment_to_response(seg)
+
+
+@app.delete("/api/v1/segments/{segment_key}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_segment(segment_key: str, db: Session = Depends(get_db)) -> None:
+    """删除分群。不存在返回 404；仍被其他分群或开关当前规则引用返回 409。"""
+    try:
+        deleted = crud.delete_segment(db, segment_key)
+    except crud.SegmentConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"分群 {segment_key!r} 不存在"
+        )
 
 
 @app.get(

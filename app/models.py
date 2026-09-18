@@ -85,6 +85,34 @@ class FlagOverride(Base):
     )
 
 
+class Segment(Base):
+    """受众分群：可嵌套的 all/any/not 表达式 + 属性比较条件 + 分群引用。
+
+    expression_json 存表达式树根节点（JSON 文本），形如::
+
+        {"all": [{"attribute": "age", "operator": "gte", "values": [18]},
+                 {"segment": "beta_users"},
+                 {"not": {"attribute": "region", "operator": "eq", "values": ["us"]}}]}
+
+    保存时校验：引用的分群必须存在、不得形成直接或间接循环引用（422）；
+    被其他分群或开关当前规则引用的分群禁止更新 / 删除（409），
+    避免既有判定静默变化。
+    """
+
+    __tablename__ = "segments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    segment_key: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(512), default="")
+    expression_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class ReleaseBatch(Base):
     """多开关发布批次：一次预览、一次原子提交、提交幂等。
 
