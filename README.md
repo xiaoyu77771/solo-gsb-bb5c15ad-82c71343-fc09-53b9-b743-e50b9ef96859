@@ -14,7 +14,8 @@
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
 - 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
-- 支持**多开关发布批次**：一次提交多个开关的候选配置并逐开关生成影响预览（不改动当前配置），提交时在单一事务内再核对全部版本，任一冲突整体回滚 `409`、绝不部分写入，重复提交幂等返回首次结果。
+- 支持**多开关发布批次**：一次提交多个开关的候选配置并逐开关生成影响预览（不改动当前配置），提交时在单一事务内再核对全部版本，任一冲突整体回滚 `409`、绝不部分写入，重复提交幂等返回首次结果；
+- 支持**受众分群（segments）**：用可嵌套的 `all` / `any` / `not` 表达式组合属性比较条件，并允许引用其他分群（判定时递归解析）；开关规则新增 `segment` 操作符直接引用分群。保存分群检测直接 / 间接循环引用（`422`）；被引用的分群禁止更新 / 删除（`409`），保证既有判定（含历史版本重放）不静默变化。
 
 ## 一条命令启动
 
@@ -64,6 +65,18 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
 
 # 撤销后该用户恢复规则 / 分桶判定
 curl -sS -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/user-1001
+
+# 5) 受众分群：创建“beta 地区的非封禁 VIP”，开关规则用 segment 操作符引用
+curl -sS -X POST http://localhost:8000/api/v1/segments \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_key":"vip_users","expression":{"type":"condition","attribute":"tier","operator":"eq","values":["vip"]}}'
+curl -sS -X POST http://localhost:8000/api/v1/segments \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_key":"beta_vip","description":"beta 地区且未封禁的 VIP",
+       "expression":{"type":"all","children":[
+         {"type":"condition","attribute":"region","operator":"in","values":["cn","sg"]},
+         {"type":"not","child":{"type":"condition","attribute":"banned","operator":"eq","values":[true]}},
+         {"type":"segment","key":"vip_users"}]}}'
 ```
 
 ## API 一览
@@ -74,6 +87,11 @@ curl -sS -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/use
 | `GET` | `/api/v1/flags` | 列出全部开关 |
 | `GET` | `/api/v1/flags/{flag_key}` | 查看单个开关 |
 | `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史与 override 一并删除） |
+| `POST` | `/api/v1/segments` | 创建受众分群（嵌套 all/any/not 表达式，可引用其他分群；循环引用 / 引用缺失 / 过深过大返回 `422`，key 重复返回 `409`） |
+| `GET` | `/api/v1/segments` | 列出全部分群 |
+| `GET` | `/api/v1/segments/{segment_key}` | 查看单个分群 |
+| `PUT` | `/api/v1/segments/{segment_key}` | 整体更新分群表达式（不存在 `404`；仍被分群或开关规则引用返回 `409`；表达式非法 `422`） |
+| `DELETE` | `/api/v1/segments/{segment_key}` | 删除分群（不存在 `404`；仍被引用返回 `409`） |
 | `PUT` | `/api/v1/flags/{flag_key}/overrides/{user_id}` | 写入 / 更新按用户临时强制变体（variant_key、reason、可选 expires_at） |
 | `DELETE` | `/api/v1/flags/{flag_key}/overrides/{user_id}` | 撤销按用户临时强制变体 |
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
@@ -294,8 +312,90 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
 | `in` / `not_in` | 属于 / 不属于集合 | 整个 `values` |
 | `gt` / `gte` / `lt` / `lte` | 数值比较 | 取 `values[0]`，两侧非数字视为未命中 |
 | `prefix` / `suffix` / `contains` | 字符串前缀 / 后缀 / 包含 | 取 `values[0]`，两侧非字符串视为未命中 |
+| `segment` | 受众分群命中（见[受众分群](#受众分群segments)） | 不使用 `values` / `attribute`，改为提供 `segment_key` |
 
 属性不存在、值为 `null`、或类型不兼容时，该规则**记为未命中并附原因**，继续判定后续规则。
+
+`segment` 规则的请求形态（其余字段与普通规则一致）：
+
+```json
+{"priority": 1, "operator": "segment", "segment_key": "beta_vip", "variant_key": "on"}
+```
+
+- `operator="segment"` 时**必须**提供 `segment_key`，且不允许提供 `attribute` / `values`；其他操作符不允许提供 `segment_key`，违反返回 `422`；
+- 规则引用的分群必须存在，否则创建 / 更新开关、影响预览与发布批次创建均返回 `422`；发布批次提交时在事务内再次核对，分群已被删除则整批 `409`。
+
+### 受众分群（segments）
+
+受众分群把复杂的人群条件沉淀为可复用、可嵌套、可互相组合的命名表达式，开关规则通过 `segment` 操作符引用。
+
+**表达式节点**（一棵树，根节点可为任意类型）：
+
+| 节点 | JSON 形态 | 语义 |
+| --- | --- | --- |
+| 条件叶子 | `{"type":"condition","attribute":"region","operator":"in","values":["cn","sg"]}` | 属性比较，操作符集合与属性规则相同（`eq/ne/in/not_in/gt/gte/lt/lte/prefix/suffix/contains`）；属性缺失 / 值为 `null` / 类型不兼容按**不命中** |
+| 全部满足 | `{"type":"all","children":[ ... ]}` | 所有子表达式为真才命中（AND，至少 1 个子表达式），遇首个**假**子表达式**短路** |
+| 任一满足 | `{"type":"any","children":[ ... ]}` | 任一子表达式为真即命中（OR，至少 1 个），遇首个**真**子表达式**短路** |
+| 逻辑非 | `{"type":"not","child":{ ... }}` | 子表达式为假时命中 |
+| 分群引用 | `{"type":"segment","key":"vip_users"}` | 判定时**递归解析**被引用分群 |
+
+**创建 / 查询 / 更新 / 删除**：
+
+```bash
+# 创建（segment_key 随 body 提供；key 重复返回 409）
+curl -sS -X POST http://localhost:8000/api/v1/segments \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_key":"vip_users","description":"付费 VIP",
+       "expression":{"type":"condition","attribute":"tier","operator":"eq","values":["vip"]}}'
+
+# 列表 / 单查
+curl -sS http://localhost:8000/api/v1/segments
+curl -sS http://localhost:8000/api/v1/segments/vip_users
+
+# 整体覆盖表达式（PUT 语义）
+curl -sS -X PUT http://localhost:8000/api/v1/segments/vip_users \
+  -H 'Content-Type: application/json' \
+  -d '{"expression":{"type":"condition","attribute":"tier","operator":"in","values":["vip","svip"]}}'
+
+# 删除
+curl -sS -X DELETE http://localhost:8000/api/v1/segments/vip_users
+```
+
+**保存期约束（不满足返回 `422`）**：
+
+- 表达式结构必须合法：`all` / `any` 至少 1 个 `children`，`not` 必须有 `child`，条件的 `values` 非空，条件操作符不能使用 `segment`（那是规则专用操作符）；
+- `segment` 引用的分群必须**已存在**（需要先建被引用方，再建引用方）；
+- **直接或间接循环引用一律拒绝**，detail 给出环路径（如 `a -> b -> a`）；
+- 表达式节点数上限 `500`；分群引用链完全内联后的展开深度上限 `32`。
+
+**引用保护（更新 / 删除返回 `409`）**：
+
+分群一旦被其他分群的表达式或开关规则引用（含 `flag_config_versions` 中的**历史版本规则**），其更新与删除都会被拒绝，detail 列出全部引用方（分群 key / 开关 key / `flag_key@v版本`）。这是刻意的设计：分群定义不可变，钉住 `config_version` 的历史判定与已有判定快照才不会因依赖的人群定义被改写而静默变化。需要调整人群逻辑时请**新建分群并迁移引用**（例如发布引用新分群的新规则版本，旧分群在没有历史版本引用后即可删除——删除开关会一并释放其全部历史版本引用）。
+
+**判定期语义**：
+
+- 判定 `segment` 规则时从根分群开始**递归解析**引用，每层分群独立求值；
+- 被引用分群缺失（防御性场景，如手工损坏的历史数据）或引用链成环（保存期已拦截，运行时再次兜底）一律按**该分群不命中**处理并继续后续规则，不返回 5xx；
+- 属性缺失、条件不兼容同样按不命中；`all` / `any` 短路后续子表达式不再解析；
+- 单次判定设有递归节点预算（`5000`），超出按不命中处理，防止病态引用链拖垮服务。
+
+**解释链（explanation）记录每层分群与短路结果**。`segment` 规则的解释链在常规 `rule_evaluated` 步骤之前插入下列步骤：
+
+| step | 记录内容 |
+| --- | --- |
+| `segment_entered` | 进入一层分群：`segment_key`、`depth`（根分群为 1，每跨过一个引用 +1）、`root`、引用来源 `ref_path` |
+| `segment_condition_evaluated` | 条件叶子的属性 / 操作符 / 值、命中结果与原因（缺失属性在此注明） |
+| `segment_group_entered` | 进入 `all` / `any` 组合：子表达式数量 |
+| `segment_group_short_circuited` | 短路：操作符、短路位置 `short_circuit_index`、已求值结果 |
+| `segment_group_evaluated` | `all` / `any` / `not` 的最终结果与原因 |
+| `segment_evaluated` | 离开一层分群：该层最终 `hit` / `miss`（内层先于外层记录） |
+| `segment_reference_missing` | 被引用分群不存在，按不命中处理 |
+| `segment_cycle_detected` | 运行时检测到引用链成环，按不命中处理（防御性兜底） |
+
+示例：分群 `beta_vip = all(region ∈ {cn,sg}, not(banned), vip_users)`，对 `{"region":"cn","tier":"vip"}` 判定时解释链为
+`rules_loaded → segment_entered(beta_vip) → segment_group_entered(all) → segment_condition_evaluated(region hit) → segment_condition_evaluated(banned miss→not hit) → segment_entered(vip_users) → segment_condition_evaluated(tier hit) → segment_evaluated(vip_users hit) → segment_group_evaluated(all hit) → segment_evaluated(beta_vip hit) → rule_evaluated(hit) → rule_selected`。
+
+分群表 `segments` 随服务启动自动创建（新库由建表流程创建，老库启动时幂等补齐），无需手工迁移。
 
 ### 判定响应与解释链
 
@@ -552,13 +652,14 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由、错误处理、幂等、种子数据
-│   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
-│   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
+│   ├── engine.py      # 规则判定 + segment 操作符 + 稳定哈希分桶 + 解释链（纯函数，易测）
+│   ├── segments.py    # 受众分群表达式引擎：all/any/not/condition/segment 递归解析、短路 trace、循环引用与深度校验
+│   ├── schemas.py     # Pydantic 请求/响应模型与配置校验（含分群递归表达式模型）
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
-│   ├── crud.py        # 配置、版本、override、发布批次与快照持久化（含原子提交、分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / release_batches / decision_snapshots）
+│   ├── crud.py        # 配置、版本、override、分群、发布批次与快照持久化（含原子提交、引用保护、分页查询与索引补齐）
+│   ├── models.py      # SQLAlchemy ORM（segments / flag_configs / flag_config_versions / flag_overrides / release_batches / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（137 项，含 override、生效窗口与发布批次用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（176 项，含分群、override、生效窗口与发布批次用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -577,4 +678,4 @@ python -m pytest -q
 - 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除；
 - 发布批次（`release_batches`）只增不删：`pending` 批次保留创建时的候选与预览摘要，`committed` 批次额外固化各开关提交后的新版本号；删除开关不会删除历史批次记录（其中仅存创建时的配置快照与预览，不影响线上判定）；
 - 快照保存判定时的 `config_version` 与 `decision_path`（含 override 的变体与原因）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
-- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）。以上迁移均为幂等，重复启动无副作用。
+- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）；升级到含受众分群的版本时，老库会自动创建 `segments` 表。以上迁移均为幂等，重复启动无副作用。

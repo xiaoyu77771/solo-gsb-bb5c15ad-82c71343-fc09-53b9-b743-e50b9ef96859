@@ -114,6 +114,32 @@ class ReleaseBatch(Base):
     committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class Segment(Base):
+    """受众分群：可嵌套 all/any/not 表达式 + 属性条件 + 分群引用。
+
+    expression_json 存一棵表达式树（结构见 app.segments 与 schemas）：
+    - condition 叶子：{"type":"condition","attribute","operator","values"}
+    - 布尔组合：{"type":"all"|"any","children":[...]} / {"type":"not","child":{...}}
+    - 分群引用：{"type":"segment","key":"<segment_key>"}
+
+    保存时校验引用存在性与直接 / 间接循环引用（422）；被其他分群或开关
+    规则引用的分群禁止更新 / 删除（409），保证既有判定不会静默变化。
+    """
+
+    __tablename__ = "segments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    segment_key: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(512), default="")
+    expression_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 

@@ -1,28 +1,154 @@
 """请求 / 响应数据模型（Pydantic v2）。"""
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-Operator = Literal["eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte", "prefix", "suffix", "contains"]
+# ConditionOperator 与 app.segments 的操作符集合保持一致；
+# 分群表达式的递归结构在本文件下方定义。
+
+# 分群条件叶子支持的属性比较操作符（"segment" 是规则专用操作符，不在此列）
+ConditionOperator = Literal[
+    "eq",
+    "ne",
+    "in",
+    "not_in",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "prefix",
+    "suffix",
+    "contains",
+]
+
+Operator = Literal[
+    "eq",
+    "ne",
+    "in",
+    "not_in",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "prefix",
+    "suffix",
+    "contains",
+    "segment",
+]
 
 
-class RuleIn(BaseModel):
-    """有序属性规则。priority 越小优先级越高。"""
+class SegmentExprBase(BaseModel):
+    """分群表达式节点基类（type 判别联合）。"""
 
-    priority: int = Field(ge=1, description="优先级，数字越小越先判定")
+
+class SegmentConditionExpr(SegmentExprBase):
+    """属性比较条件叶子，比较语义与开关属性规则一致。"""
+
+    type: Literal["condition"] = "condition"
     attribute: str = Field(min_length=1, description="要检查的用户属性名，如 region / age")
-    operator: Operator = "eq"
-    values: list[Any] = Field(default_factory=list, description="比较值；eq/ne/gt 等取第一个")
-    variant_key: str = Field(min_length=1, description="命中后返回的变体 key")
+    operator: ConditionOperator = "eq"
+    values: list[Any] = Field(description="比较值；eq/ne/gt 等取第一个，in/not_in 用整个列表")
 
     @field_validator("values")
     @classmethod
     def _values_not_empty(cls, v: list[Any]) -> list[Any]:
         if not v:
-            raise ValueError("规则必须提供至少一个比较值 values")
+            raise ValueError("条件必须提供至少一个比较值 values")
         return v
+
+
+class SegmentRefExpr(SegmentExprBase):
+    """引用其他分群；判定时递归解析。"""
+
+    type: Literal["segment"] = "segment"
+    key: str = Field(min_length=1, max_length=128, description="被引用分群的 key")
+
+
+class SegmentAllExpr(SegmentExprBase):
+    """所有子表达式均为真才命中（AND），遇首个假子表达式短路。"""
+
+    type: Literal["all"] = "all"
+    children: list["SegmentExpr"] = Field(min_length=1)
+
+
+class SegmentAnyExpr(SegmentExprBase):
+    """任一子表达式为真即命中（OR），遇首个真子表达式短路。"""
+
+    type: Literal["any"] = "any"
+    children: list["SegmentExpr"] = Field(min_length=1)
+
+
+class SegmentNotExpr(SegmentExprBase):
+    """子表达式为假时命中（NOT）。"""
+
+    type: Literal["not"] = "not"
+    child: SegmentExpr
+
+
+# 可嵌套的分群表达式：condition / all / any / not / segment 引用
+SegmentExpr = Union[
+    SegmentConditionExpr,
+    SegmentAllExpr,
+    SegmentAnyExpr,
+    SegmentNotExpr,
+    SegmentRefExpr,
+]
+
+# 前向引用（递归联合）需要在全部类定义后重建
+for _model in (
+    SegmentConditionExpr,
+    SegmentRefExpr,
+    SegmentAllExpr,
+    SegmentAnyExpr,
+    SegmentNotExpr,
+):
+    _model.model_rebuild()
+
+
+class RuleIn(BaseModel):
+    """有序属性规则。priority 越小优先级越高。
+
+    操作符为 ``segment`` 时，规则按 ``segment_key`` 引用受众分群判定，
+    不需要 attribute / values；其余操作符按 attribute + values 做属性比较。
+    """
+
+    priority: int = Field(ge=1, description="优先级，数字越小越先判定")
+    attribute: str | None = Field(
+        default=None, min_length=1, description="要检查的用户属性名，如 region / age"
+    )
+    operator: Operator = "eq"
+    values: list[Any] = Field(
+        default_factory=list, description="比较值；eq/ne/gt 等取第一个"
+    )
+    variant_key: str = Field(min_length=1, description="命中后返回的变体 key")
+    segment_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="operator=segment 时引用的受众分群 key；其他操作符必须为 null",
+    )
+
+    @model_validator(mode="after")
+    def _operator_shape(self) -> "RuleIn":
+        if self.operator == "segment":
+            if not self.segment_key:
+                raise ValueError("operator=segment 时必须提供 segment_key")
+            if self.attribute is not None:
+                raise ValueError("operator=segment 时不允许提供 attribute")
+            if self.values:
+                raise ValueError("operator=segment 时不允许提供 values")
+        else:
+            if self.segment_key is not None:
+                raise ValueError("segment_key 仅可在 operator=segment 时提供")
+            if not self.attribute:
+                raise ValueError("属性规则必须提供 attribute")
+            if not self.values:
+                raise ValueError("规则必须提供至少一个比较值 values")
+        return self
 
 
 class VariantIn(BaseModel):
@@ -389,3 +515,39 @@ class ReleaseResponse(BaseModel):
     items: list[ReleaseItemResponse]
     created_at: Any
     committed_at: Any = Field(description="提交完成时间（UTC）；批次未提交时为 null")
+
+
+# ---------------------------------------------------------------------------
+# 受众分群
+# ---------------------------------------------------------------------------
+
+
+class SegmentCreateRequest(BaseModel):
+    """创建分群请求（key 随 body 提供，与创建开关风格一致）。"""
+
+    segment_key: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    description: str = ""
+    expression: SegmentExpr = Field(description="分群表达式树（all/any/not/condition/segment）")
+
+
+class SegmentUpsertRequest(BaseModel):
+    """更新分群的请求体（分群 key 取自路径，整体覆盖 expression）。
+
+    表达式为可嵌套的 all/any/not + condition + segment 引用；
+    引用存在性、循环引用与深度 / 大小上限由持久层在保存时校验（422）。
+    """
+
+    description: str = ""
+    expression: SegmentExpr = Field(description="分群表达式树（all/any/not/condition/segment）")
+
+
+class SegmentResponse(BaseModel):
+    """一个受众分群的当前状态。"""
+
+    segment_key: str
+    description: str
+    expression: SegmentExpr
+    created_at: Any
+    updated_at: Any

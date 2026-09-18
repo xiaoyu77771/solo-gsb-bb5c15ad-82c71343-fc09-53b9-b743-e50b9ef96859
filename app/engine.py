@@ -16,9 +16,12 @@
 """
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from app import segments as seg
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
 BUCKET_SPACE = 100
@@ -27,10 +30,12 @@ BUCKET_SPACE = 100
 @dataclass(frozen=True)
 class Rule:
     priority: int
-    attribute: str
+    attribute: str | None
     operator: str
     values: list[Any]
     variant_key: str
+    # operator == "segment" 时引用的受众分群 key；其余操作符为 None
+    segment_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -254,8 +259,15 @@ def decide(
     context: dict[str, Any],
     variants: list[Variant],
     rules: list[Rule],
+    segment_resolver: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> Decision:
-    """完整判定流程并产出解释链。"""
+    """完整判定流程并产出解释链。
+
+    ``operator="segment"`` 的规则通过 ``segment_resolver`` 递归解析受众
+    分群（表达式可嵌套 all/any/not、属性条件并引用其他分群）；resolver
+    缺失、被引用分群不存在或引用链成环均按未命中处理，分群每层的进入 /
+    离开与短路结果以 ``segment_*`` 步骤并入解释链。
+    """
     explanation: list[dict[str, Any]] = []
     variant_keys = {v.key for v in variants}
 
@@ -266,7 +278,13 @@ def decide(
             "detail": {
                 "rule_count": len(ordered),
                 "evaluation_order": [
-                    {"rule_index": i, "priority": r.priority, "attribute": r.attribute}
+                    {
+                        "rule_index": i,
+                        "priority": r.priority,
+                        "attribute": r.attribute,
+                        "operator": r.operator,
+                        "segment_key": r.segment_key,
+                    }
                     for i, r in enumerate(ordered)
                 ],
             },
@@ -279,7 +297,17 @@ def decide(
             raise RuleEvaluationError(
                 f"priority={rule.priority} 的规则引用了不存在的变体 {rule.variant_key!r}"
             )
-        hit, reason = evaluate_rule(rule, context)
+
+        if rule.operator == "segment":
+            hit, reason, trace = seg.evaluate_segment_rule(
+                rule.segment_key, context, segment_resolver
+            )
+            # 分群内部每层判定（进入 / 条件 / 短路 / 离开）先并入解释链，
+            # 再追加规则级步骤，保持“先因后果”的阅读顺序。
+            explanation.extend(trace)
+        else:
+            hit, reason = evaluate_rule(rule, context)
+
         explanation.append(
             {
                 "step": "rule_evaluated",
@@ -289,6 +317,7 @@ def decide(
                     "attribute": rule.attribute,
                     "operator": rule.operator,
                     "values": rule.values,
+                    "segment_key": rule.segment_key,
                     "result": "hit" if hit else "miss",
                     "reason": reason,
                 },

@@ -8,12 +8,14 @@ from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.orm import Session
 
 from app import engine as eng
+from app import segments as seg
 from app.models import (
     DecisionSnapshot,
     FlagConfig,
     FlagConfigVersion,
     FlagOverride,
     ReleaseBatch,
+    Segment,
     _utcnow,
 )
 from app.schemas import (
@@ -22,12 +24,26 @@ from app.schemas import (
     FlagUpsertRequest,
     OverrideUpsertRequest,
     RuleIn,
+    SegmentCreateRequest,
+    SegmentUpsertRequest,
     VariantIn,
 )
 
 
 class NotFound(Exception):
     """开关不存在。"""
+
+
+class SegmentNotFound(Exception):
+    """分群不存在。"""
+
+
+class SegmentKeyConflict(Exception):
+    """创建分群时 key 已存在。"""
+
+
+class SegmentInUse(Exception):
+    """分群仍被其他分群或开关规则引用，禁止更新 / 删除。"""
 
 
 class VersionNotFound(Exception):
@@ -600,6 +616,13 @@ def commit_release(db: Session, batch: ReleaseBatch) -> ReleaseBatch:
                 raise VersionConflict(
                     _release_conflict_message(db, item)
                 )
+            # 候选中的 segment 规则在创建时已校验；提交前再核对分群仍存在，
+            # 防止创建批次后分群被删除导致提交结果与预览不一致（整批 409）。
+            candidate_rules = [RuleIn(**r) for r in json.loads(item["rules_json"])]
+            try:
+                validate_flag_rule_segments(db, candidate_rules)
+            except ValueError as exc:
+                raise VersionConflict(str(exc)) from exc
             new_versions[item["flag_key"]] = expected + 1
 
         # 全部条件更新命中后，在同一事务追加不可变版本（只增不改）
@@ -641,6 +664,194 @@ def _release_conflict_message(db: Session, item: dict) -> str:
         f"开关 {item['flag_key']!r} 当前版本为 {flag.version}，与批次期望版本 "
         f"{item['expected_version']} 不一致"
     )
+
+
+# ---------------------------------------------------------------------------
+# 受众分群
+# ---------------------------------------------------------------------------
+
+
+def _all_segment_expressions(db: Session) -> dict[str, dict]:
+    """返回当前全部分群 key -> 表达式（保存期引用图校验用）。"""
+    return {s.segment_key: json.loads(s.expression_json) for s in list_segments(db)}
+
+
+def get_segment(db: Session, segment_key: str) -> Segment | None:
+    return db.scalar(select(Segment).where(Segment.segment_key == segment_key))
+
+
+def list_segments(db: Session) -> Sequence[Segment]:
+    return db.scalars(select(Segment).order_by(Segment.segment_key)).all()
+
+
+def create_segment(db: Session, segment_key: str, payload: SegmentCreateRequest) -> Segment:
+    """创建分群；key 已存在抛 SegmentKeyConflict。
+
+    保存前校验引用存在性、直接 / 间接循环引用与深度 / 大小上限，
+    任一不满足抛 SegmentValidationError（路由层映射为 422）。
+    """
+    if get_segment(db, segment_key) is not None:
+        raise SegmentKeyConflict(f"分群 {segment_key!r} 已存在")
+    expression = payload.expression.model_dump()
+    seg.validate_segment_definition(segment_key, expression, _all_segment_expressions(db))
+    segment = Segment(
+        segment_key=segment_key,
+        description=payload.description,
+        expression_json=json.dumps(expression, ensure_ascii=False),
+    )
+    db.add(segment)
+    db.commit()
+    db.refresh(segment)
+    return segment
+
+
+def update_segment(db: Session, segment_key: str, payload: SegmentUpsertRequest) -> Segment:
+    """整体覆盖分群表达式；不存在抛 SegmentNotFound。
+
+    分群仍被其他分群或开关规则引用时禁止更新（SegmentInUse -> 409），
+    避免既有判定静默变化；校验规则同创建。
+    """
+    segment = get_segment(db, segment_key)
+    if segment is None:
+        raise SegmentNotFound(segment_key)
+    referrers = find_segment_referrers(db, segment_key)
+    if any(referrers.values()):
+        raise SegmentInUse(_segment_in_use_message(segment_key, referrers))
+    expression = payload.expression.model_dump()
+    # 校验时图中不含自身（自身即将被覆盖）
+    existing = _all_segment_expressions(db)
+    existing.pop(segment_key, None)
+    seg.validate_segment_definition(segment_key, expression, existing)
+    segment.description = payload.description
+    segment.expression_json = json.dumps(expression, ensure_ascii=False)
+    db.commit()
+    db.refresh(segment)
+    return segment
+
+
+def delete_segment(db: Session, segment_key: str) -> bool:
+    """删除分群；不存在返回 False，仍被引用抛 SegmentInUse（-> 409）。"""
+    segment = get_segment(db, segment_key)
+    if segment is None:
+        return False
+    referrers = find_segment_referrers(db, segment_key)
+    if any(referrers.values()):
+        raise SegmentInUse(_segment_in_use_message(segment_key, referrers))
+    db.delete(segment)
+    db.commit()
+    return True
+
+
+def _segment_in_use_message(segment_key: str, referrers: dict) -> str:
+    parts = []
+    if referrers.get("segments"):
+        parts.append("被分群 " + ", ".join(referrers["segments"]) + " 引用")
+    if referrers.get("flags"):
+        parts.append("被开关当前配置 " + ", ".join(referrers["flags"]) + " 引用")
+    if referrers.get("versions"):
+        parts.append("被开关历史版本 " + ", ".join(referrers["versions"]) + " 引用")
+    return f"分群 {segment_key!r} 仍被引用（{'；'.join(parts)}），禁止更新 / 删除以避免既有判定静默变化"
+
+
+def find_segment_referrers(db: Session, segment_key: str) -> dict:
+    """找出引用指定分群的全部分群与开关规则（含历史版本）。
+
+    返回 {"segments": [...], "flags": [...], "versions": [...]}：
+    - segments：表达式中 segment 节点引用该 key 的其他分群；
+    - flags：当前规则（operator=segment）引用该 key 的开关；
+    - versions：历史版本规则引用该 key 的 "flag_key@version" 列表。
+    分群一旦被引用即冻结（更新 / 删除均 409），因此历史版本规则引用的
+    分群定义不会随时间变化，钉住 config_version 的判定可稳定重放。
+    """
+    segment_refs = [
+        s.segment_key
+        for s in list_segments(db)
+        if s.segment_key != segment_key
+        and segment_key in seg.collect_segment_refs(json.loads(s.expression_json))
+    ]
+
+    def _rule_refs(rules_raw: str) -> bool:
+        for item in json.loads(rules_raw or "[]"):
+            if item.get("operator") == "segment" and item.get("segment_key") == segment_key:
+                return True
+        return False
+
+    flag_refs = [f.flag_key for f in list_flags(db) if _rule_refs(f.rules_json)]
+    version_refs = [
+        f"{v.flag_key}@v{v.version}"
+        for v in db.scalars(select(FlagConfigVersion)).all()
+        if _rule_refs(v.rules_json)
+    ]
+    return {
+        "segments": sorted(set(segment_refs)),
+        "flags": sorted(set(flag_refs)),
+        "versions": sorted(set(version_refs)),
+    }
+
+
+def validate_flag_rule_segments(db: Session, rules: Sequence[RuleIn]) -> None:
+    """校验开关候选配置中 segment 规则引用的分群均存在，否则 ValueError（422/409）。"""
+    keys = {r.segment_key for r in rules if r.operator == "segment"}
+    if not keys:
+        return
+    existing = {s.segment_key for s in list_segments(db)}
+    missing = sorted(keys - existing)
+    if missing:
+        raise ValueError(f"规则引用了不存在的分群：{', '.join(missing)}")
+
+
+class DBSegmentResolver:
+    """判定期分群解析器：按 key 读表达式，单次判定内缓存并校验引用链。
+
+    被引用分群缺失（如开关历史版本早于分群建立、或分群已被删除——正常
+    情况下引用中的分群无法删除）返回 None，引擎按不命中处理。
+    """
+
+    def __init__(self, db: Session):
+        self._db = db
+        self._cache: dict[str, dict | None] = {}
+
+    def __call__(self, key: str) -> dict | None:
+        if key not in self._cache:
+            segment = get_segment(self._db, key)
+            self._cache[key] = json.loads(segment.expression_json) if segment is not None else None
+        return self._cache[key]
+
+
+def segment_to_response(segment: Segment) -> dict:
+    return {
+        "segment_key": segment.segment_key,
+        "description": segment.description,
+        "expression": json.loads(segment.expression_json),
+        "created_at": segment.created_at,
+        "updated_at": segment.updated_at,
+    }
+
+
+def ensure_segments_table(db: Session) -> None:
+    """老库幂等补齐 segments 表。
+
+    全新库由 ``Base.metadata.create_all`` 直接建表；老库若因启动顺序缺失，
+    用 CREATE TABLE IF NOT EXISTS 兜底，重复执行为空操作。
+    """
+    db.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS segments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "segment_key VARCHAR(128) NOT NULL UNIQUE, "
+            "description VARCHAR(512) DEFAULT '', "
+            "expression_json TEXT NOT NULL, "
+            "created_at DATETIME, "
+            "updated_at DATETIME)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_segments_segment_key "
+            "ON segments (segment_key)"
+        )
+    )
+    db.commit()
 
 
 def _utc_aware(dt: datetime) -> datetime:

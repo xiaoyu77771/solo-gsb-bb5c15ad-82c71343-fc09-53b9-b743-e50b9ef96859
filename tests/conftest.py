@@ -13,13 +13,19 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine, SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import FlagConfig, FlagConfigVersion, FlagOverride  # noqa: E402
+from app.models import FlagConfig, FlagConfigVersion, FlagOverride, Segment  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_schema():
+    """会话级建表（不依赖 client 夹具，纯引擎单测也会触发 autouse 清理）。"""
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    yield
 
 
 @pytest.fixture(scope="session")
 def client():
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
     # 不跑 lifespan 种子数据，测试自行准备配置
     with TestClient(app) as c:
         yield c
@@ -27,13 +33,17 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clean_flags():
-    """每个用例后清空开关、版本历史与强制变体，保证 flag_key 可重复使用（快照保留）。"""
+    """每个用例后清空分群、开关、版本历史与强制变体，保证 key 可重复使用（快照保留）。
+
+    分群先于开关规则删除顺序无依赖（分群引用约束为应用层校验，非外键）。
+    """
     yield
     db = SessionLocal()
     try:
         db.query(FlagOverride).delete()
         db.query(FlagConfigVersion).delete()
         db.query(FlagConfig).delete()
+        db.query(Segment).delete()
         db.commit()
     finally:
         db.close()
